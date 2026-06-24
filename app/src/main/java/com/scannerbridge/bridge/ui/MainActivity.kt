@@ -369,6 +369,12 @@ class MainActivity : AppCompatActivity(),
     // ---------------- camera callbacks ----------------
     override fun onCameraOpened(width: Int, height: Int) {
         cameraReady = true
+        // If we're already streaming (paired before the webcam opened), make
+        // sure this freshly-opened camera feeds the live bridge so real frames
+        // replace the placeholder on the PC.
+        if (frameBridge != null) {
+            cameraFragment?.frameBridge = frameBridge
+        }
         runOnUiThread {
             binding.previewPlaceholder.visibility = View.GONE
             binding.statRes.text = "${width}\u00d7${height}"

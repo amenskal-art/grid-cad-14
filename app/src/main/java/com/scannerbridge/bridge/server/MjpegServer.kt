@@ -51,6 +51,7 @@ class MjpegServer(private val port: Int = 8080) {
     /** Newest JPEG bytes, shared by all client writers. */
     private val latestJpeg = AtomicReference<ByteArray?>(null)
     private val frameSeq = AtomicInteger(0)
+    @Volatile private var cachedPlaceholder: ByteArray? = null
 
     private val clientCount = AtomicInteger(0)
 
@@ -170,6 +171,29 @@ class MjpegServer(private val port: Int = 8080) {
         var lastSeq = -1
         val frameIntervalMs = (1000 / TARGET_FPS).toLong()
         try {
+            // Send an immediate placeholder frame so the PC's FFmpeg-based
+            // VideoCapture sees a valid first JPEG right away and isOpened()
+            // returns true. Without this, if the webcam isn't feeding frames
+            // yet, FFmpeg waits for the first frame, times out (~30s), and the
+            // PC reports "Could not reach wireless scanner" even though the
+            // connection succeeded. Real frames replace this as soon as the
+            // webcam starts.
+            var sentAny = false
+            run {
+                val first = latestJpeg.get() ?: placeholderJpeg()
+                writeFramePart(out, first)
+                sentAny = true
+            }
+
+            // Keep sending the placeholder at a slow cadence until real frames
+            // arrive, so the connection never sits empty and time out.
+            var waitedMs = 0L
+            while (running.get() && latestJpeg.get() == null) {
+                Thread.sleep(200)
+                waitedMs += 200
+                writeFramePart(out, placeholderJpeg())
+            }
+
             while (running.get()) {
                 val seq = frameSeq.get()
                 if (seq == lastSeq) {
@@ -178,15 +202,7 @@ class MjpegServer(private val port: Int = 8080) {
                 }
                 lastSeq = seq
                 val jpeg = latestJpeg.get() ?: continue
-
-                val partHeader = "--$BOUNDARY\r\n" +
-                        "Content-Type: image/jpeg\r\n" +
-                        "Content-Length: ${jpeg.size}\r\n\r\n"
-                out.write(partHeader.toByteArray())
-                out.write(jpeg)
-                out.write("\r\n".toByteArray())
-                out.flush()
-
+                writeFramePart(out, jpeg)
                 Thread.sleep(frameIntervalMs)
             }
         } catch (_: Exception) {
@@ -195,5 +211,37 @@ class MjpegServer(private val port: Int = 8080) {
             val c = clientCount.decrementAndGet()
             listener?.onClientCountChanged(c)
         }
+    }
+
+    private fun writeFramePart(out: OutputStream, jpeg: ByteArray) {
+        val partHeader = "--$BOUNDARY\r\n" +
+                "Content-Type: image/jpeg\r\n" +
+                "Content-Length: ${jpeg.size}\r\n\r\n"
+        out.write(partHeader.toByteArray())
+        out.write(jpeg)
+        out.write("\r\n".toByteArray())
+        out.flush()
+    }
+
+    /** A tiny solid-color JPEG used before the webcam starts feeding frames. */
+    private fun placeholderJpeg(): ByteArray {
+        cachedPlaceholder?.let { return it }
+        val w = 640; val h = 480
+        val bmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bmp)
+        canvas.drawColor(android.graphics.Color.rgb(10, 14, 20))
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.rgb(40, 208, 232)
+            textSize = 28f
+            isAntiAlias = true
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        canvas.drawText("Scanner Bridge \u2014 starting camera...", w / 2f, h / 2f, paint)
+        val baos = ByteArrayOutputStream()
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, baos)
+        bmp.recycle()
+        val bytes = baos.toByteArray()
+        cachedPlaceholder = bytes
+        return bytes
     }
 }
